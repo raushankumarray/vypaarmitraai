@@ -1,0 +1,132 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'SUPER_ADMIN' || 
+        getUserData().role == 'SUPER_ADMIN'
+      );
+    }
+    
+    function isSupport() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'SUPPORT' || 
+        getUserData().role == 'SUPPORT'
+      );
+    }
+    
+    function isDeveloper() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'DEVELOPER' || 
+        getUserData().role == 'DEVELOPER'
+      );
+    }
+    
+    function belongsToCompany(companyId) {
+      return isAuthenticated() && (
+        request.auth.token.companyId == companyId ||
+        getUserData().companyId == companyId
+      );
+    }
+
+    // System configurations & metadata
+    match /businessTypes/{typeId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+    
+    match /plans/{planId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+    
+    match /modules/{moduleId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // System Audit & Diagnostics
+    match /auditLogs/{logId} {
+      allow read: if isSuperAdmin() || isSupport();
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Immutable audit trail
+    }
+
+    match /systemLogs/{logId} {
+      allow read, write: if isSuperAdmin() || isDeveloper();
+    }
+
+    match /errorLogs/{logId} {
+      allow read: if isSuperAdmin() || isDeveloper();
+      allow create: if true; // Allow client error reporting
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // Companies / Tenants
+    match /companies/{companyId} {
+      allow read: if isSuperAdmin() || isSupport() || belongsToCompany(companyId);
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() || (belongsToCompany(companyId) && getUserData().role == 'MERCHANT');
+      allow delete: if isSuperAdmin();
+    }
+
+    // User profiles
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == userId ||
+        isSuperAdmin() ||
+        isSupport() ||
+        belongsToCompany(resource.data.companyId)
+      );
+      allow create: if isSuperAdmin() || (
+        isAuthenticated() && 
+        getUserData().role == 'MERCHANT' && 
+        request.resource.data.companyId == getUserData().companyId
+      );
+      allow update: if isSuperAdmin() || (
+        request.auth.uid == userId
+      ) || (
+        isAuthenticated() && 
+        getUserData().role == 'MERCHANT' && 
+        resource.data.companyId == getUserData().companyId
+      );
+      allow delete: if isSuperAdmin() || (
+        isAuthenticated() && 
+        getUserData().role == 'MERCHANT' && 
+        resource.data.companyId == getUserData().companyId
+      );
+    }
+
+    // Generic Merchant Tenant Collection Rule
+    // Every business record MUST contain companyId matching the caller's tenant
+    match /{collectionName}/{docId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (resource != null && belongsToCompany(resource.data.companyId)) ||
+        (isSupport() && request.auth.token.supportLevel in ['L1', 'L2', 'L3', 'L4'])
+      );
+      allow create: if isAuthenticated() && (
+        isSuperAdmin() ||
+        belongsToCompany(request.resource.data.companyId)
+      );
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (resource != null && belongsToCompany(resource.data.companyId) && request.resource.data.companyId == resource.data.companyId)
+      );
+      allow delete: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (resource != null && belongsToCompany(resource.data.companyId) && getUserData().role == 'MERCHANT')
+      );
+    }
+  }
+}

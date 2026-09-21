@@ -82,6 +82,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const updated = localStore.getUser(user.id);
         if (updated) {
           setUser({ ...updated });
+          setMustChangePassword(Boolean(updated.mustChangePassword));
           if (updated.companyId) {
             setCompany(localStore.getCompany(updated.companyId) || null);
           }
@@ -89,7 +90,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     });
     return () => unsub();
-  }, []);
+  }, [user]);
 
   // Route protection and panel guard
   useEffect(() => {
@@ -125,8 +126,56 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = async (identifier: string, pass: string): Promise<{ success: boolean; error?: string }> => {
     try {
+      // 1. Authoritative server-side master database authentication across all devices
+      try {
+        const res = await fetch('/api/system/db', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'AUTH',
+            identifier,
+            password: pass,
+          }),
+        });
+
+        const data = await res.json();
+        if (data && data.success && data.user) {
+          // Hydrate localStore with the authoritative master database state
+          if (data.masterState) {
+            localStore.applyMasterState(data.masterState);
+          }
+
+          const authedUser = data.user;
+          const requiredChange = Boolean(data.mustChangePassword);
+
+          setUser(authedUser);
+          setMustChangePassword(requiredChange);
+          localStorage.setItem('vypaarmitra_uid', authedUser.id);
+
+          if (data.company) {
+            setCompany(data.company);
+          } else if (authedUser.companyId) {
+            const comp = localStore.getCompany(authedUser.companyId);
+            setCompany(comp || null);
+          }
+
+          if (requiredChange) {
+            router.push('/force-password-change');
+          } else {
+            router.push(ROLE_ROUTE_PREFIX[authedUser.role as UserRole] || '/superadmin');
+          }
+
+          return { success: true };
+        } else if (data && data.error && !data.message?.includes('Server error')) {
+          // Authoritative error from master DB (e.g., incorrect password, account suspended)
+          return { success: false, error: data.error };
+        }
+      } catch (serverErr) {
+        console.warn('[Auth] Server-side auth request fallback to local sync', serverErr);
+      }
+
+      // 2. Offline / local fallback
       let authResult = localStore.authenticateUser(identifier, pass);
-      // If authentication fails initially, verify with server & cloud in case account was created on another device
       if (!authResult) {
         await localStore.syncWithServerAndCloud();
         authResult = localStore.authenticateUser(identifier, pass);
@@ -216,7 +265,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const updatePassword = async (newPass: string): Promise<boolean> => {
     if (!user) return false;
+
+    // 1. Update in local store
     const ok = localStore.changeUserPassword(user.id, newPass);
+
+    // 2. Persist to server master database immediately across all devices
+    try {
+      await fetch('/api/system/db', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'UPDATE_PASSWORD',
+          userId: user.id,
+          password: newPass,
+          mustChangePassword: false,
+        }),
+      });
+    } catch (e) {
+      console.warn('[Auth] Update password server sync notice:', e);
+    }
+
     if (ok) {
       setMustChangePassword(false);
       setUser({ ...user, mustChangePassword: false });

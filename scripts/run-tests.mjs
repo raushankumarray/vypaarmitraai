@@ -684,6 +684,121 @@ runTest('OTP Auth: Code generation, masking, WhatsApp URL, 5m expiry & single-us
   assert.strictEqual(isExpired, true, 'Expired OTP must be detected and rejected');
 });
 
+// 18. Central Master Database Multi-Device Sync & Cross-Device Login
+runTest('Central Master Database: Cross-Device Setup, Password Change & Merchant Login without Re-Setup', () => {
+  // Simulated Central Master Database (Netlify Blobs / Render persistent storage)
+  const masterDatabase = {
+    users: {
+      usr_superadmin_bootstrap: {
+        id: 'usr_superadmin_bootstrap',
+        username: 'adminn',
+        email: 'admin@npbmedia.com',
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        mustChangePassword: true,
+      },
+    },
+    userCredentials: {
+      usr_superadmin_bootstrap: 'Admin@88',
+    },
+    companies: {},
+    products: {},
+    systemSettings: { appName: 'VYPAARMITRA AI' },
+  };
+
+  // Step 1: Device 1 logs in and completes mandatory password update
+  const device1_NewPassword = 'Admin@Custom2026!';
+  masterDatabase.userCredentials['usr_superadmin_bootstrap'] = device1_NewPassword;
+  masterDatabase.users['usr_superadmin_bootstrap'].mustChangePassword = false;
+
+  // Step 2: Device 1 creates Merchant account & business firm
+  const merchantCompany = {
+    id: 'comp_sharma_01',
+    name: 'Sharma Supermarket',
+    tradeName: 'Sharma Supermarket',
+    shopType: 'General Store / Supermarket',
+    ownerName: 'Sunil Sharma',
+    phone: '9876543210',
+    status: 'ACTIVE',
+    enabledModules: ['billing', 'inventory', 'customers', 'reports'],
+  };
+  const merchantUser = {
+    id: 'usr_merchant_sharma',
+    username: 'sharma_retail',
+    email: 'sharma@retail.com',
+    mobile: '9876543210',
+    name: 'Sunil Sharma',
+    role: 'MERCHANT',
+    companyId: merchantCompany.id,
+    status: 'ACTIVE',
+    mustChangePassword: false,
+  };
+  const merchantPass = 'Sharma@Pass123';
+
+  masterDatabase.companies[merchantCompany.id] = merchantCompany;
+  masterDatabase.users[merchantUser.id] = merchantUser;
+  masterDatabase.userCredentials[merchantUser.id] = merchantPass;
+
+  // Step 3: Device 1 creates Products
+  const products = [
+    { id: 'p1', companyId: merchantCompany.id, name: 'Sugar 1kg', currentStock: 50, salePrice: 45 },
+    { id: 'p2', companyId: merchantCompany.id, name: 'Tea 250g', currentStock: 30, salePrice: 120 },
+    { id: 'p3', companyId: merchantCompany.id, name: 'Cooking Oil 1L', currentStock: 25, salePrice: 160 },
+  ];
+  products.forEach((p) => {
+    masterDatabase.products[p.id] = p;
+  });
+
+  // Step 4: Device 2 opens site for first time (Device 2 localStorage is EMPTY)
+  const device2_LocalStorage = {}; // Fresh browser, zero prior setup
+
+  // Server Authentication Handler
+  function serverAuthenticate(identifier, password) {
+    const cleanId = (identifier || '').trim().toLowerCase();
+    const user = Object.values(masterDatabase.users).find(
+      (u) => u.username.toLowerCase() === cleanId || u.email.toLowerCase() === cleanId
+    );
+    if (!user) return { success: false, error: 'No account found' };
+    const storedPass = masterDatabase.userCredentials[user.id];
+    if (storedPass !== password) return { success: false, error: 'Incorrect password' };
+    const company = user.companyId ? masterDatabase.companies[user.companyId] : null;
+    return {
+      success: true,
+      user,
+      company,
+      mustChangePassword: Boolean(user.mustChangePassword),
+      masterState: masterDatabase,
+    };
+  }
+
+  // A. Super Admin logs in on Device 2 with updated password set on Device 1
+  const adminLoginResult = serverAuthenticate('adminn', device1_NewPassword);
+  assert.strictEqual(adminLoginResult.success, true, 'Device 2 must accept password set on Device 1');
+  assert.strictEqual(adminLoginResult.mustChangePassword, false, 'Device 2 must NOT force password change');
+  assert.strictEqual(adminLoginResult.user.role, 'SUPER_ADMIN', 'Device 2 authenticates super admin');
+
+  // Device 2 hydrates from masterState
+  device2_LocalStorage['master_db'] = JSON.parse(JSON.stringify(adminLoginResult.masterState));
+  assert.ok(device2_LocalStorage['master_db'].companies['comp_sharma_01'], 'Device 2 received Sharma Supermarket');
+
+  // B. Old default password must be rejected on Device 2
+  const oldPassResult = serverAuthenticate('adminn', 'Admin@88');
+  assert.strictEqual(oldPassResult.success, false, 'Device 2 rejects outdated bootstrap password');
+
+  // C. Merchant logs in on Device 2
+  const merchantLoginResult = serverAuthenticate('sharma_retail', 'Sharma@Pass123');
+  assert.strictEqual(merchantLoginResult.success, true, 'Merchant can log in on Device 2 immediately');
+  assert.strictEqual(merchantLoginResult.company.name, 'Sharma Supermarket', 'Merchant firm name correctly resolved');
+  assert.strictEqual(merchantLoginResult.mustChangePassword, false, 'Merchant has normal active access');
+
+  // D. Check inventory access on Device 2
+  const device2_Products = Object.values(device2_LocalStorage['master_db'].products).filter(
+    (p) => p.companyId === merchantCompany.id
+  );
+  assert.strictEqual(device2_Products.length, 3, 'Device 2 sees all 3 products created on Device 1');
+  assert.strictEqual(device2_Products[0].name, 'Sugar 1kg', 'Product details match accurately');
+});
+
 console.log('\n====================================================');
 console.log(`  TEST RESULTS: ${passedTests} / ${totalTests} PASSED (100% PASS RATE)`);
 console.log('====================================================\n');

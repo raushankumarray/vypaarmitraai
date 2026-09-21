@@ -607,6 +607,19 @@ class DataStore {
     if (typeof window === 'undefined') return false;
 
     try {
+      // 0. Fetch authoritative master database (Netlify Blobs / Render persistent storage)
+      try {
+        const dbRes = await fetch('/api/system/db').catch(() => null);
+        if (dbRes && dbRes.ok) {
+          const dbJson = await dbRes.json();
+          if (dbJson && dbJson.success && dbJson.data) {
+            this.applyMasterState(dbJson.data);
+          }
+        }
+      } catch (dbErr) {
+        console.warn('[Sync] Master database fetch notice:', dbErr);
+      }
+
       // 1. Fetch persistent server cloud configuration
       const serverRes = await fetch('/api/system/cloud-config').catch(() => null);
       if (serverRes && serverRes.ok) {
@@ -618,7 +631,7 @@ class DataStore {
           if (adminUser) {
             this.state.userCredentials['usr_superadmin_bootstrap'] = serverData.adminCredentials.password;
             adminUser.mustChangePassword = Boolean(serverData.adminCredentials.mustChangePassword);
-            this.persist();
+            this.persistInternalOnly();
           }
         }
 
@@ -806,6 +819,149 @@ class DataStore {
     };
   }
 
+  private syncAllTimer: any = null;
+
+  public scheduleSyncAllToServer() {
+    if (typeof window === 'undefined') return;
+    if (this.syncAllTimer) {
+      clearTimeout(this.syncAllTimer);
+    }
+    this.syncAllTimer = setTimeout(() => {
+      this.syncAllToServer();
+    }, 1500);
+  }
+
+  public async syncAllToServer(): Promise<boolean> {
+    if (typeof window === 'undefined') return false;
+    try {
+      const res = await fetch('/api/system/db', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'SYNC_ALL',
+          state: this.state,
+        }),
+      });
+      return res.ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  public pushMutationToServer(
+    action: 'SYNC_RECORD' | 'DELETE_RECORD' | 'DELETE_RECORDS' | 'UPDATE_PASSWORD',
+    collection?: string,
+    id?: string,
+    data?: any,
+    extra?: any
+  ) {
+    if (typeof window === 'undefined') return;
+    try {
+      fetch('/api/system/db', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          collection,
+          id,
+          data,
+          ...extra,
+        }),
+      }).catch((err) => {
+        console.warn('[Sync] Master database background mutation notice:', err);
+      });
+    } catch (e) {
+      // Non-blocking
+    }
+  }
+
+  public applyMasterState(db: any): void {
+    if (!db || typeof db !== 'object') return;
+
+    let hasChanges = false;
+
+    // 1. Users and Credentials
+    if (db.users && typeof db.users === 'object' && Object.keys(db.users).length > 0) {
+      this.state.users = {
+        ...this.state.users,
+        ...db.users,
+      };
+      hasChanges = true;
+    }
+    if (db.userCredentials && typeof db.userCredentials === 'object' && Object.keys(db.userCredentials).length > 0) {
+      this.state.userCredentials = {
+        ...this.state.userCredentials,
+        ...db.userCredentials,
+      };
+      hasChanges = true;
+    }
+
+    // 2. Collections: Authoritative merge
+    const collections: (keyof AppStoreState)[] = [
+      'companies',
+      'plans',
+      'products',
+      'stockMovements',
+      'sales',
+      'purchases',
+      'customers',
+      'suppliers',
+      'expenses',
+      'attendance',
+      'supportTickets',
+      'businessTypes',
+      'auditLogs',
+    ];
+
+    for (const col of collections) {
+      if (db[col] && typeof db[col] === 'object') {
+        (this.state as any)[col] = {
+          ...((this.state as any)[col] || {}),
+          ...db[col],
+        };
+        hasChanges = true;
+      }
+    }
+
+    // 3. System Settings
+    if (db.systemSettings && typeof db.systemSettings === 'object') {
+      this.state.systemSettings = {
+        ...this.state.systemSettings,
+        ...db.systemSettings,
+      };
+      hasChanges = true;
+    }
+
+    // 4. Filter out any tombstoned items
+    if (this.state.deletedTombstones) {
+      for (const col of collections) {
+        const target = (this.state as any)[col];
+        if (target && typeof target === 'object') {
+          for (const key of Object.keys(target)) {
+            if (this.isTombstoned(col as string, key)) {
+              delete target[key];
+            }
+          }
+        }
+      }
+    }
+
+    if (hasChanges) {
+      this.persistInternalOnly();
+    }
+  }
+
+  public persistInternalOnly() {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+      } catch (e) {
+        console.warn('Store persist error', e);
+      }
+    }
+    this.notify();
+  }
+
   private persist() {
     if (typeof window !== 'undefined') {
       try {
@@ -813,6 +969,7 @@ class DataStore {
       } catch (e) {
         console.warn('Store persist error', e);
       }
+      this.scheduleSyncAllToServer();
     }
     this.notify();
   }
@@ -915,6 +1072,13 @@ class DataStore {
         }),
       }).catch(() => {});
     }
+
+    // 3. Central master database password persistence across all devices
+    this.pushMutationToServer('UPDATE_PASSWORD', undefined, userId, undefined, {
+      userId,
+      password: newPassword,
+      mustChangePassword: false,
+    });
 
     return true;
   }
@@ -1197,6 +1361,10 @@ class DataStore {
       this.state.userCredentials[user.id] = password;
     }
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'users', user.id, user);
+    if (password) {
+      this.pushMutationToServer('SYNC_RECORD', 'userCredentials', user.id, password);
+    }
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'users', user.id, user);
     if (password) {
       cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'userCredentials', user.id, password);
@@ -1208,6 +1376,7 @@ class DataStore {
       this.state.users[userId].status = status;
       this.state.users[userId].updatedAt = new Date().toISOString();
       this.persist();
+      this.pushMutationToServer('SYNC_RECORD', 'users', userId, this.state.users[userId]);
       cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'users', userId, this.state.users[userId]);
     }
   }
@@ -1224,6 +1393,7 @@ class DataStore {
   public saveCompany(company: Company) {
     this.state.companies[company.id] = company;
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'companies', company.id, company);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'companies', company.id, company);
   }
 
@@ -1352,6 +1522,13 @@ class DataStore {
 
     this.persist();
 
+    // Central master database deletion
+    this.pushMutationToServer('DELETE_RECORD', 'companies', companyId);
+    if (tenantUserIds.length > 0) {
+      this.pushMutationToServer('DELETE_RECORDS', 'users', undefined, undefined, { ids: tenantUserIds });
+      this.pushMutationToServer('DELETE_RECORDS', 'userCredentials', undefined, undefined, { ids: tenantUserIds });
+    }
+
     // Permanent cloud deletion
     const cfg = this.getFirebaseCloudConfig();
     cloudSync.deleteRecord(cfg, 'companies', companyId);
@@ -1417,18 +1594,18 @@ class DataStore {
         });
 
         // Delete Suppliers
-        Object.values(this.state.suppliers || {}).forEach((su) => {
-          if (su.companyId === companyId) delete this.state.suppliers[su.id];
+        Object.values(this.state.suppliers || {}).forEach((s) => {
+          if (s.companyId === companyId) delete this.state.suppliers[s.id];
         });
 
         // Delete Expenses
-        Object.values(this.state.expenses || {}).forEach((ex) => {
-          if (ex.companyId === companyId) delete this.state.expenses[ex.id];
+        Object.values(this.state.expenses || {}).forEach((e) => {
+          if (e.companyId === companyId) delete this.state.expenses[e.id];
         });
 
         // Delete Attendance
-        Object.values(this.state.attendance || {}).forEach((att) => {
-          if (att.companyId === companyId) delete this.state.attendance[att.id];
+        Object.values(this.state.attendance || {}).forEach((a) => {
+          if (a.companyId === companyId) delete this.state.attendance[a.id];
         });
 
         // Delete Support Tickets
@@ -1456,6 +1633,7 @@ class DataStore {
         details: `Bulk permanently deleted ${deletedCount} business tenants (${deletedNames.join(', ')}) and all associated database records`,
       });
       this.persist();
+      this.pushMutationToServer('DELETE_RECORDS', 'companies', undefined, undefined, { ids: companyIds });
       cloudSync.deleteRecords(this.getFirebaseCloudConfig(), 'companies', companyIds);
     }
 
@@ -1480,6 +1658,8 @@ class DataStore {
         details: `Permanently deleted ${u.role} account @${u.username} (${u.name})`,
       });
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'users', userId);
+      this.pushMutationToServer('DELETE_RECORD', 'userCredentials', userId);
       const cfg = this.getFirebaseCloudConfig();
       cloudSync.deleteRecord(cfg, 'users', userId);
       cloudSync.deleteRecord(cfg, 'userCredentials', userId);
@@ -1512,6 +1692,8 @@ class DataStore {
         details: `Bulk permanently deleted ${deletedCount} staff accounts (${deletedUsernames.join(', ')}) from database`,
       });
       this.persist();
+      this.pushMutationToServer('DELETE_RECORDS', 'users', undefined, undefined, { ids: userIds });
+      this.pushMutationToServer('DELETE_RECORDS', 'userCredentials', undefined, undefined, { ids: userIds });
       const cfg = this.getFirebaseCloudConfig();
       cloudSync.deleteRecords(cfg, 'users', userIds);
       cloudSync.deleteRecords(cfg, 'userCredentials', userIds);
@@ -1567,6 +1749,7 @@ class DataStore {
       details: `Subscription plan '${plan.name}' pricing set to ₹${plan.priceMonthly}/mo, ₹${plan.priceYearly}/yr`,
     });
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'plans', plan.id, plan);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'plans', plan.id, plan);
   }
 
@@ -1600,6 +1783,7 @@ class DataStore {
         details: `Deleted subscription plan '${planName}' (${planId})`,
       });
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'plans', planId);
       cloudSync.deleteRecord(this.getFirebaseCloudConfig(), 'plans', planId);
     }
   }
@@ -1619,6 +1803,7 @@ class DataStore {
     if (!this.state.businessTypes) this.state.businessTypes = {};
     this.state.businessTypes[businessType.id] = businessType;
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'businessTypes', businessType.id, businessType);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'businessTypes', businessType.id, businessType);
   }
 
@@ -1672,6 +1857,7 @@ class DataStore {
     }
 
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'products', product.id, this.state.products[product.id]);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'products', product.id, this.state.products[product.id]);
     return this.state.products[product.id];
   }
@@ -1682,6 +1868,7 @@ class DataStore {
       delete this.state.products[id];
       this.recordTombstone('products', id);
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'products', id);
       cloudSync.deleteRecord(this.getFirebaseCloudConfig(), 'products', id);
     }
   }
@@ -1697,6 +1884,7 @@ class DataStore {
 
     this.state.stockMovements[id] = fullMovement;
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'stockMovements', id, fullMovement);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'stockMovements', id, fullMovement);
     return fullMovement;
   }
@@ -1807,6 +1995,7 @@ class DataStore {
     });
 
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'sales', sale.id, sale);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'sales', sale.id, sale);
     return sale;
   }
@@ -1852,6 +2041,7 @@ class DataStore {
       cust.totalPaid -= sale.paidAmount;
       cust.totalDue = Math.max(0, cust.totalDue - sale.dueAmount);
       cust.updatedAt = new Date().toISOString();
+      this.pushMutationToServer('SYNC_RECORD', 'customers', cust.id, cust);
       cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'customers', cust.id, cust);
     }
 
@@ -1868,6 +2058,7 @@ class DataStore {
     });
 
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'sales', sale.id, sale);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'sales', sale.id, sale);
     return true;
   }
@@ -1970,6 +2161,7 @@ class DataStore {
       updatedAt: new Date().toISOString(),
     };
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'customers', customer.id, this.state.customers[customer.id]);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'customers', customer.id, this.state.customers[customer.id]);
   }
 
@@ -1994,6 +2186,7 @@ class DataStore {
     });
 
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'customers', cust.id, cust);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'customers', cust.id, cust);
     return true;
   }
@@ -2011,6 +2204,7 @@ class DataStore {
       updatedAt: new Date().toISOString(),
     };
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'suppliers', supplier.id, this.state.suppliers[supplier.id]);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'suppliers', supplier.id, this.state.suppliers[supplier.id]);
   }
 
@@ -2022,6 +2216,7 @@ class DataStore {
     sup.payableBalance = Math.max(0, sup.payableBalance - amount);
     sup.updatedAt = new Date().toISOString();
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'suppliers', sup.id, sup);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'suppliers', sup.id, sup);
     return true;
   }
@@ -2036,6 +2231,7 @@ class DataStore {
   public saveExpense(expense: Expense) {
     this.state.expenses[expense.id] = expense;
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'expenses', expense.id, expense);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'expenses', expense.id, expense);
   }
 
@@ -2049,6 +2245,7 @@ class DataStore {
   public saveAttendance(record: AttendanceRecord) {
     this.state.attendance[record.id] = record;
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'attendance', record.id, record);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'attendance', record.id, record);
   }
 
@@ -2065,6 +2262,7 @@ class DataStore {
       updatedAt: new Date().toISOString(),
     };
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'supportTickets', ticket.id, this.state.supportTickets[ticket.id]);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'supportTickets', ticket.id, this.state.supportTickets[ticket.id]);
   }
 
@@ -2074,6 +2272,7 @@ class DataStore {
       delete this.state.customers[id];
       this.recordTombstone('customers', id);
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'customers', id);
       cloudSync.deleteRecord(this.getFirebaseCloudConfig(), 'customers', id);
       return true;
     }
@@ -2086,6 +2285,7 @@ class DataStore {
       delete this.state.suppliers[id];
       this.recordTombstone('suppliers', id);
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'suppliers', id);
       cloudSync.deleteRecord(this.getFirebaseCloudConfig(), 'suppliers', id);
       return true;
     }
@@ -2098,6 +2298,7 @@ class DataStore {
       delete this.state.expenses[id];
       this.recordTombstone('expenses', id);
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'expenses', id);
       cloudSync.deleteRecord(this.getFirebaseCloudConfig(), 'expenses', id);
       return true;
     }
@@ -2110,6 +2311,7 @@ class DataStore {
       delete this.state.sales[id];
       this.recordTombstone('sales', id);
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'sales', id);
       cloudSync.deleteRecord(this.getFirebaseCloudConfig(), 'sales', id);
       return true;
     }
@@ -2121,6 +2323,7 @@ class DataStore {
       delete this.state.supportTickets[id];
       this.recordTombstone('supportTickets', id);
       this.persist();
+      this.pushMutationToServer('DELETE_RECORD', 'supportTickets', id);
       cloudSync.deleteRecord(this.getFirebaseCloudConfig(), 'supportTickets', id);
       return true;
     }
@@ -2149,6 +2352,7 @@ class DataStore {
       details: 'Updated system branding, company logo, or Firebase cloud configuration',
     });
     this.persist();
+    this.pushMutationToServer('SYNC_RECORD', 'systemSettings', 'config', this.state.systemSettings);
     cloudSync.syncRecord(this.getFirebaseCloudConfig(), 'systemSettings', 'config', this.state.systemSettings);
   }
 

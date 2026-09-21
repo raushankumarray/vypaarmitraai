@@ -20,3 +20,7 @@
 
 # typescript
 *.tsbuildinfo
+
+# local runtime data
+/data/
+.env*.local

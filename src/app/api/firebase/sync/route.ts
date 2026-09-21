@@ -1,4 +1,37 @@
 import { NextRequest, NextResponse } from 'next/server';
+import fs from 'fs';
+import path from 'path';
+
+function persistServerConfig(cfg: any) {
+  try {
+    if (!cfg || !cfg.projectId) return;
+    const dir = path.join(process.cwd(), 'data');
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const filePath = path.join(dir, 'system_cloud_config.json');
+    let existing: any = {};
+    if (fs.existsSync(filePath)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
+      } catch {}
+    }
+    const updated = {
+      ...existing,
+      projectId: cfg.projectId.trim(),
+      databaseURL: formatDbUrl(cfg.databaseURL, cfg.projectId),
+      serviceAccountKeyJson: cfg.serviceAccountKeyJson?.trim() || existing.serviceAccountKeyJson || '',
+      connected: true,
+      syncStatus: 'CONNECTED',
+      syncMode: cfg.syncMode || 'DUAL_SYNC',
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'SYNC_API',
+    };
+    fs.writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
+  } catch (e) {
+    // non-fatal
+  }
+}
 
 function formatDbUrl(rawUrl?: string, projectId?: string): string {
   let url = (rawUrl || '').trim().replace(/\/+$/, '');
@@ -115,6 +148,7 @@ export async function POST(req: NextRequest) {
     // 1. TEST DUAL CONNECTION (Realtime Database + Cloud Firestore)
     // =========================================================================
     if (action === 'TEST') {
+      persistServerConfig(config);
       let rtdbActive = false;
       let firestoreActive = false;
 
@@ -175,6 +209,7 @@ export async function POST(req: NextRequest) {
     // 2. PUSH ALL (Writes across 16 SaaS collections to RTDB & Firestore)
     // =========================================================================
     if (action === 'PUSH_ALL') {
+      persistServerConfig(config);
       // 2A. Push to Firebase Realtime Database
       let rtdbSaved = false;
       try {

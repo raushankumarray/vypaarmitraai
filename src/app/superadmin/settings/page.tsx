@@ -326,23 +326,26 @@ export default function SuperAdminSettingsPage() {
     setTestResult(null);
 
     // Save current config
-    localStore.saveFirebaseCloudConfig({
+    const updateCfg: FirebaseCloudConfig = {
       projectId: fbProjectId.trim(),
       databaseURL: fbDatabaseUrl.trim(),
       serviceAccountKeyJson: fbServiceAccountJson.trim(),
       connected: true,
       syncStatus: 'CONNECTED',
-    });
+      syncMode: 'DUAL_SYNC',
+    };
+    localStore.saveFirebaseCloudConfig(updateCfg);
+
+    // Save to server for all devices
+    fetch('/api/system/cloud-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'SAVE', config: updateCfg }),
+    }).catch(() => {});
 
     const fullState = (localStore as any).state || {};
     const res = await cloudSync.pushAll(
-      {
-        projectId: fbProjectId.trim(),
-        databaseURL: fbDatabaseUrl.trim(),
-        serviceAccountKeyJson: fbServiceAccountJson.trim(),
-        connected: true,
-        syncStatus: 'CONNECTED',
-      },
+      updateCfg,
       fullState
     );
 
@@ -371,6 +374,13 @@ export default function SuperAdminSettingsPage() {
     };
 
     localStore.saveFirebaseCloudConfig(cfg);
+
+    // Save to server so all other devices immediately connect
+    fetch('/api/system/cloud-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'SAVE', config: cfg }),
+    }).catch(() => {});
 
     // Auto-restore existing cloud data from Realtime DB / Firestore if available
     try {
@@ -408,6 +418,14 @@ export default function SuperAdminSettingsPage() {
   // F. Disconnect Firebase and Clean Data
   const handleConfirmDisconnect = () => {
     localStore.disconnectFirebaseAndClear();
+
+    // Disconnect on server for all devices
+    fetch('/api/system/cloud-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'DISCONNECT' }),
+    }).catch(() => {});
+
     setFbConnected(false);
     setShowDisconnectModal(false);
     loadData();

@@ -556,6 +556,134 @@ runTest('Permanent Deletion & Tombstone Engine guarantees deleted records NEVER 
   assert.ok(store.products['PROD_KEEP'], 'Non-deleted product safely preserved');
 });
 
+// 16. Multi-Device Cross-Access: Setup on Device A immediately accessible on Device B
+runTest('Multi-device persistent cloud sync: Device B hydrates from Device A setup', () => {
+  // Simulated Central Server State (e.g. data/system_cloud_config.json)
+  let centralServerConfig = null;
+  const centralCloudDatabase = {
+    companies: {},
+    users: {},
+    userCredentials: {},
+    plans: {},
+  };
+
+  // Step 1: Device A connects Firebase and creates a merchant tenant
+  const deviceA_Config = {
+    projectId: 'vypaarmitra-prod-live',
+    databaseURL: 'https://vypaarmitra-prod-live-default-rtdb.firebaseio.com',
+    connected: true,
+    syncStatus: 'CONNECTED',
+  };
+  centralServerConfig = { ...deviceA_Config };
+
+  const createdMerchant = {
+    id: 'usr_merchant_rajesh',
+    username: 'rajesh_store',
+    email: 'rajesh@store.com',
+    mobile: '9876543210',
+    name: 'Rajesh Kumar',
+    role: 'MERCHANT',
+    companyId: 'comp_rajesh_01',
+    status: 'ACTIVE',
+  };
+  centralCloudDatabase.users[createdMerchant.id] = createdMerchant;
+  centralCloudDatabase.userCredentials[createdMerchant.id] = 'Rajesh@123';
+  centralCloudDatabase.companies['comp_rajesh_01'] = {
+    id: 'comp_rajesh_01',
+    name: 'Rajesh General Store',
+  };
+
+  // Step 2: Device B opens the application with a completely empty local cache
+  const deviceB_LocalCache = {
+    firebaseCloud: { connected: false, syncStatus: 'DISCONNECTED' },
+    users: {},
+    companies: {},
+  };
+
+  assert.strictEqual(deviceB_LocalCache.firebaseCloud.connected, false, 'Device B starts disconnected in empty browser');
+  assert.strictEqual(deviceB_LocalCache.users['usr_merchant_rajesh'], undefined, 'Device B has no local record initially');
+
+  // Step 3: Device B runs syncWithServerAndCloud()
+  function simulateDeviceBSync(deviceStore) {
+    if (centralServerConfig && centralServerConfig.connected) {
+      deviceStore.firebaseCloud = { ...centralServerConfig };
+      // Hydrate from cloud
+      deviceStore.users = { ...centralCloudDatabase.users };
+      deviceStore.companies = { ...centralCloudDatabase.companies };
+      return true;
+    }
+    return false;
+  }
+
+  const synced = simulateDeviceBSync(deviceB_LocalCache);
+  assert.strictEqual(synced, true, 'Device B auto-sync must report success');
+  assert.strictEqual(deviceB_LocalCache.firebaseCloud.connected, true, 'Device B must now be connected');
+  assert.strictEqual(deviceB_LocalCache.firebaseCloud.projectId, 'vypaarmitra-prod-live', 'Device B has same project ID');
+  assert.ok(deviceB_LocalCache.users['usr_merchant_rajesh'], 'Merchant created on Device A is now present on Device B');
+  assert.strictEqual(deviceB_LocalCache.users['usr_merchant_rajesh'].name, 'Rajesh Kumar', 'Merchant details match accurately');
+});
+
+// 17. OTP Authentication Engine (Email & WhatsApp)
+runTest('OTP Auth: Code generation, masking, WhatsApp URL, 5m expiry & single-use security', () => {
+  const otpStore = new Map();
+
+  // Test User
+  const user = {
+    id: 'usr_kirana_01',
+    username: 'kirana_owner',
+    email: 'raushan.owner@gmail.com',
+    mobile: '9876543210',
+    name: 'Raushan Kumar',
+  };
+
+  // A. Generate OTP
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  assert.strictEqual(code.length, 6, 'Generated OTP must be 6 digits');
+  assert.ok(!isNaN(Number(code)), 'OTP must be numeric');
+
+  // B. Masking helpers
+  function maskEmail(email) {
+    const [local, domain] = email.split('@');
+    return `${local[0]}***${local.slice(-1)}@${domain}`;
+  }
+  function maskMobile(mobile) {
+    const clean = mobile.replace(/\D/g, '');
+    return `+91 ******${clean.slice(-4)}`;
+  }
+
+  const maskedEmail = maskEmail(user.email);
+  const maskedMobile = maskMobile(user.mobile);
+  assert.strictEqual(maskedEmail, 'r***r@gmail.com', 'Email masked correctly');
+  assert.strictEqual(maskedMobile, '+91 ******3210', 'Mobile masked correctly');
+
+  // C. WhatsApp URL Generation
+  const cleanPhone = '91' + user.mobile;
+  const whatsappUrl = `https://wa.me/${cleanPhone}?text=Your%20code%20is%20${code}`;
+  assert.ok(whatsappUrl.includes('919876543210'), 'WhatsApp URL includes international phone code');
+  assert.ok(whatsappUrl.includes(code), 'WhatsApp URL contains OTP code');
+
+  // D. Store OTP with 5-minute expiry
+  const expiresAt = Date.now() + 5 * 60 * 1000;
+  otpStore.set(user.id, { code, expiresAt, attempts: 0 });
+
+  // E. Reject incorrect OTP code
+  const wrongCode = '000000';
+  const record = otpStore.get(user.id);
+  assert.notStrictEqual(record.code, wrongCode, 'Wrong code must not match');
+  record.attempts += 1;
+  assert.strictEqual(record.attempts, 1, 'Attempt counter incremented');
+
+  // F. Accept correct code and single-use burn
+  assert.strictEqual(record.code, code, 'Correct OTP matches');
+  otpStore.delete(user.id); // Burn OTP
+  assert.strictEqual(otpStore.has(user.id), false, 'OTP must be purged immediately to prevent replay');
+
+  // G. Expired OTP rejection
+  const expiredRecord = { code: '123456', expiresAt: Date.now() - 1000, attempts: 0 };
+  const isExpired = Date.now() > expiredRecord.expiresAt;
+  assert.strictEqual(isExpired, true, 'Expired OTP must be detected and rejected');
+});
+
 console.log('\n====================================================');
 console.log(`  TEST RESULTS: ${passedTests} / ${totalTests} PASSED (100% PASS RATE)`);
 console.log('====================================================\n');

@@ -589,23 +589,75 @@ class DataStore {
     if (typeof window !== 'undefined') {
       setTimeout(() => {
         this.initCloudAutoSync();
-      }, 400);
+      }, 200);
+
+      // Auto-sync across devices on window focus / tab visibility
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          this.syncWithServerAndCloud();
+        }
+      });
+      window.addEventListener('focus', () => {
+        this.syncWithServerAndCloud();
+      });
     }
+  }
+
+  public async syncWithServerAndCloud(): Promise<boolean> {
+    if (typeof window === 'undefined') return false;
+
+    try {
+      // 1. Fetch persistent server cloud configuration
+      const serverRes = await fetch('/api/system/cloud-config').catch(() => null);
+      if (serverRes && serverRes.ok) {
+        const serverData = await serverRes.json();
+
+        // A. If server has a connected Firebase project, adopt it
+        if (serverData.configured && serverData.config && serverData.config.projectId) {
+          const currentLocal = this.getFirebaseCloudConfig();
+          const serverCfg = serverData.config;
+
+          if (!currentLocal.connected || currentLocal.projectId !== serverCfg.projectId || currentLocal.databaseURL !== serverCfg.databaseURL) {
+            this.saveFirebaseCloudConfig(serverCfg);
+          }
+
+          // Pull authoritative database state from Firebase
+          const pullRes = await cloudSync.pullAll(serverCfg);
+          if (pullRes.success && pullRes.data) {
+            this.restoreFromFirebase(pullRes.data);
+            this.notify();
+            return true;
+          }
+        } else if (serverData.config && serverData.config.connected === false && serverData.config.updatedBy === 'SUPER_ADMIN_MANUAL_DISCONNECT') {
+          // If server was explicitly disconnected by Super Admin from another device
+          const currentLocal = this.getFirebaseCloudConfig();
+          if (currentLocal.connected) {
+            this.disconnectFirebaseAndClear();
+            this.notify();
+            return true;
+          }
+        }
+      }
+
+      // 2. Direct fallback from local config if connected
+      const localCfg = this.getFirebaseCloudConfig();
+      if (localCfg && localCfg.connected && localCfg.projectId) {
+        const pullRes = await cloudSync.pullAll(localCfg);
+        if (pullRes.success && pullRes.data) {
+          this.restoreFromFirebase(pullRes.data);
+          this.notify();
+          return true;
+        }
+      }
+    } catch (err) {
+      console.warn('[Sync] Server & Cloud synchronization notice:', err);
+    }
+    return false;
   }
 
   public async initCloudAutoSync() {
     if (typeof window !== 'undefined') {
-      const cfg = this.getFirebaseCloudConfig();
-      if (cfg && cfg.connected && cfg.projectId) {
-        try {
-          const res = await cloudSync.pullAll(cfg);
-          if (res && res.success && res.data) {
-            this.restoreFromFirebase(res.data);
-          }
-        } catch (e) {
-          console.warn('Initial cloud auto-sync notice:', e);
-        }
-      }
+      await this.syncWithServerAndCloud();
     }
   }
 
@@ -831,6 +883,165 @@ class DataStore {
 
     this.persist();
     return true;
+  }
+
+  // User Lookup Tolerant of Username, Email, or Mobile Digits
+  public findUserByIdentifier(identifier: string): User | undefined {
+    const cleanId = identifier.trim().toLowerCase();
+    const cleanDigits = identifier.replace(/\D/g, '');
+
+    return Object.values(this.state.users).find((u) => {
+      if (u.username && u.username.toLowerCase() === cleanId) return true;
+      if (u.email && u.email.toLowerCase() === cleanId) return true;
+      if (u.id && u.id.toLowerCase() === cleanId) return true;
+      if (cleanDigits && u.mobile) {
+        const userDigits = u.mobile.replace(/\D/g, '');
+        if (userDigits === cleanDigits) return true;
+        if (userDigits.endsWith(cleanDigits) || cleanDigits.endsWith(userDigits)) return true;
+      }
+      return false;
+    });
+  }
+
+  // Request / Generate Login OTP (Dispatches via Email SMTP or WhatsApp)
+  public async generateLoginOtp(
+    identifier: string,
+    channel: 'EMAIL' | 'WHATSAPP'
+  ): Promise<{
+    success: boolean;
+    error?: string;
+    maskedTarget?: string;
+    channel?: string;
+    expiresAt?: number;
+    previewCode?: string;
+    whatsappUrl?: string;
+    userId?: string;
+  }> {
+    let user = this.findUserByIdentifier(identifier);
+
+    // If user not in local memory, sync from server/cloud and search again
+    if (!user) {
+      await this.syncWithServerAndCloud();
+      user = this.findUserByIdentifier(identifier);
+    }
+
+    if (!user) {
+      return {
+        success: false,
+        error: 'No registered account found matching this Email ID, Mobile Number, or Username.',
+      };
+    }
+
+    if (user.status !== 'ACTIVE' && user.status !== 'PENDING_SETUP') {
+      return {
+        success: false,
+        error: 'This account is inactive or suspended. Please contact administrator.',
+      };
+    }
+
+    try {
+      const res = await fetch('/api/auth/otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'REQUEST_OTP',
+          userId: user.id,
+          identifier,
+          channel,
+          user: {
+            id: user.id,
+            name: user.name,
+            username: user.username,
+            email: user.email,
+            mobile: user.mobile,
+            role: user.role,
+          },
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        return {
+          success: false,
+          error: data.message || data.error || 'Failed to send OTP code. Please try again.',
+        };
+      }
+
+      return {
+        success: true,
+        maskedTarget: data.maskedTarget,
+        channel: data.channel || channel,
+        expiresAt: data.expiresAt,
+        previewCode: data.previewCode,
+        whatsappUrl: data.whatsappUrl,
+        userId: user.id,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'Network error while requesting OTP code.',
+      };
+    }
+  }
+
+  // Verify Login OTP
+  public async verifyLoginOtp(
+    identifier: string,
+    otp: string
+  ): Promise<{ success: boolean; user?: User; error?: string; mustChangePassword?: boolean }> {
+    let user = this.findUserByIdentifier(identifier);
+    if (!user) {
+      await this.syncWithServerAndCloud();
+      user = this.findUserByIdentifier(identifier);
+    }
+
+    if (!user) {
+      return { success: false, error: 'User account not found.' };
+    }
+
+    try {
+      const res = await fetch('/api/auth/otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'VERIFY_OTP',
+          userId: user.id,
+          identifier,
+          otp: otp.trim(),
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        return {
+          success: false,
+          error: data.message || data.error || 'Invalid or expired verification code.',
+        };
+      }
+
+      this.addAuditLog({
+        companyId: user.companyId,
+        userId: user.id,
+        userName: user.name,
+        userRole: user.role,
+        action: 'USER_LOGIN_OTP_SUCCESS',
+        module: 'auth',
+        entityType: 'user',
+        entityId: user.id,
+        details: `User ${user.username} authenticated successfully via OTP`,
+      });
+
+      return {
+        success: true,
+        user,
+        mustChangePassword: Boolean(user.mustChangePassword),
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'Error verifying OTP.',
+      };
+    }
   }
 
   // Audit Logs

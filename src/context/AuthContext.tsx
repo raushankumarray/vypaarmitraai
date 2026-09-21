@@ -12,6 +12,19 @@ interface AuthContextType {
   isLoading: boolean;
   mustChangePassword: boolean;
   login: (identifier: string, pass: string) => Promise<{ success: boolean; error?: string }>;
+  requestOtp: (
+    identifier: string,
+    channel: 'EMAIL' | 'WHATSAPP'
+  ) => Promise<{
+    success: boolean;
+    error?: string;
+    maskedTarget?: string;
+    channel?: string;
+    expiresAt?: number;
+    previewCode?: string;
+    whatsappUrl?: string;
+  }>;
+  loginWithOtp: (identifier: string, otp: string) => Promise<{ success: boolean; error?: string }>;
   logout: () => void;
   updatePassword: (newPass: string) => Promise<boolean>;
   refreshTenant: () => void;
@@ -112,7 +125,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = async (identifier: string, pass: string): Promise<{ success: boolean; error?: string }> => {
     try {
-      const authResult = localStore.authenticateUser(identifier, pass);
+      let authResult = localStore.authenticateUser(identifier, pass);
+      // If authentication fails initially, verify with server & cloud in case account was created on another device
+      if (!authResult) {
+        await localStore.syncWithServerAndCloud();
+        authResult = localStore.authenticateUser(identifier, pass);
+      }
+
       if (!authResult) {
         return { success: false, error: 'Invalid credentials or account is suspended.' };
       }
@@ -136,6 +155,41 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return { success: true };
     } catch (err: any) {
       return { success: false, error: err?.message || 'Login failed' };
+    }
+  };
+
+  const requestOtp = async (identifier: string, channel: 'EMAIL' | 'WHATSAPP') => {
+    return await localStore.generateLoginOtp(identifier, channel);
+  };
+
+  const loginWithOtp = async (identifier: string, otp: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const verifyResult = await localStore.verifyLoginOtp(identifier, otp);
+      if (!verifyResult.success || !verifyResult.user) {
+        return { success: false, error: verifyResult.error || 'Verification failed. Please check the OTP code.' };
+      }
+
+      const authedUser = verifyResult.user;
+      const requiredChange = Boolean(verifyResult.mustChangePassword);
+
+      setUser(authedUser);
+      setMustChangePassword(requiredChange);
+      localStorage.setItem('vypaarmitra_uid', authedUser.id);
+
+      if (authedUser.companyId) {
+        const comp = localStore.getCompany(authedUser.companyId);
+        setCompany(comp || null);
+      }
+
+      if (requiredChange) {
+        router.push('/force-password-change');
+      } else {
+        router.push(ROLE_ROUTE_PREFIX[authedUser.role]);
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'OTP authentication failed' };
     }
   };
 
@@ -202,6 +256,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isLoading,
         mustChangePassword,
         login,
+        requestOtp,
+        loginWithOtp,
         logout,
         updatePassword,
         refreshTenant,

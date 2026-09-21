@@ -34,7 +34,9 @@ import {
   Check,
   AlertTriangle,
   X,
+  Smartphone,
 } from 'lucide-react';
+import { DeviceSyncModal } from '@/components/common/DeviceSyncModal';
 
 type SettingsTab = 'PROFILE' | 'BRANDING' | 'NOTIFICATIONS' | 'FIREBASE';
 
@@ -42,6 +44,7 @@ export default function SuperAdminSettingsPage() {
   const { user } = useAuth();
   const [activeTab, setActiveTab] = useState<SettingsTab>('PROFILE');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [showDeviceModal, setShowDeviceModal] = useState(false);
 
   // 1. Profile State
   const [adminName, setAdminName] = useState('');
@@ -987,8 +990,17 @@ export default function SuperAdminSettingsPage() {
               </div>
             </div>
 
-            {/* Refresh Status Button */}
-            <div className="shrink-0">
+            {/* Action Buttons */}
+            <div className="shrink-0 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowDeviceModal(true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+                title="Connect phone or another laptop with 0 setup"
+              >
+                <Smartphone className="w-3.5 h-3.5" />
+                <span>Connect Device</span>
+              </button>
               <button
                 type="button"
                 onClick={handleRefreshStatus}
@@ -1218,6 +1230,12 @@ export default function SuperAdminSettingsPage() {
           </form>
         </div>
       )}
+
+      {/* Device Sync Modal */}
+      <DeviceSyncModal
+        isOpen={showDeviceModal}
+        onClose={() => setShowDeviceModal(false)}
+      />
     </div>
   );
 }

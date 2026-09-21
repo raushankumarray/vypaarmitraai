@@ -612,6 +612,16 @@ class DataStore {
       if (serverRes && serverRes.ok) {
         const serverData = await serverRes.json();
 
+        // Synchronize Admin Credentials if updated on another device
+        if (serverData.adminCredentials && serverData.adminCredentials.password) {
+          const adminUser = this.state.users['usr_superadmin_bootstrap'];
+          if (adminUser) {
+            this.state.userCredentials['usr_superadmin_bootstrap'] = serverData.adminCredentials.password;
+            adminUser.mustChangePassword = Boolean(serverData.adminCredentials.mustChangePassword);
+            this.persist();
+          }
+        }
+
         // A. If server has a connected Firebase project, adopt it
         if (serverData.configured && serverData.config && serverData.config.projectId) {
           const currentLocal = this.getFirebaseCloudConfig();
@@ -882,6 +892,30 @@ class DataStore {
     });
 
     this.persist();
+
+    // 1. Sync updated user credentials to Firebase if connected
+    const cloudCfg = this.getFirebaseCloudConfig();
+    if (cloudCfg && cloudCfg.connected) {
+      cloudSync.syncRecord(cloudCfg, 'users', userId, user);
+      cloudSync.syncRecord(cloudCfg, 'userCredentials', userId, newPassword);
+    }
+
+    // 2. Sync updated admin credentials to server / Netlify Blobs so other devices inherit updated credentials
+    if (typeof window !== 'undefined' && user.role === 'SUPER_ADMIN') {
+      fetch('/api/system/cloud-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'UPDATE_ADMIN_CREDENTIALS',
+          credentials: {
+            username: user.username,
+            password: newPassword,
+            mustChangePassword: false,
+          },
+        }),
+      }).catch(() => {});
+    }
+
     return true;
   }
 
@@ -2219,8 +2253,19 @@ class DataStore {
     if (cloudData.users && typeof cloudData.users === 'object') {
       const currentAdmin = this.state.users['usr_superadmin_bootstrap'] || INITIAL_SUPER_ADMIN;
       const currentAdminPass = this.state.userCredentials['usr_superadmin_bootstrap'] || 'Admin@88';
-      this.state.users = { ...cloudData.users, [currentAdmin.id]: currentAdmin };
-      this.state.userCredentials = { ...(cloudData.userCredentials || {}), [currentAdmin.id]: currentAdminPass };
+
+      // Adopt all cloud users, including any updated admin user
+      this.state.users = {
+        [currentAdmin.id]: currentAdmin,
+        ...cloudData.users,
+      };
+
+      // Adopt all cloud credentials, including any updated admin password
+      this.state.userCredentials = {
+        [currentAdmin.id]: currentAdminPass,
+        ...(cloudData.userCredentials || {}),
+      };
+
       restoredCount += Object.keys(this.state.users).length;
     }
 

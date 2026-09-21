@@ -12,12 +12,15 @@ import {
   PlusCircle,
   Store,
   Settings2,
+  Smartphone,
 } from 'lucide-react';
+import { DeviceSyncModal } from '@/components/common/DeviceSyncModal';
 
 export default function SuperAdminDashboard() {
   const { t } = useLanguage();
   const [companies, setCompanies] = useState<Company[]>([]);
   const [users, setUsers] = useState<User[]>([]);
+  const [showDeviceModal, setShowDeviceModal] = useState(false);
 
   const loadData = () => {
     setCompanies(localStore.getAllCompanies());
@@ -84,6 +87,15 @@ export default function SuperAdminDashboard() {
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowDeviceModal(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white text-xs font-bold rounded-xl shadow-md shadow-blue-500/20 transition-all cursor-pointer"
+            title="Connect phone or another laptop with 0 setup"
+          >
+            <Smartphone className="w-4 h-4" />
+            <span>Connect Device</span>
+          </button>
           <Link
             href="/superadmin/businesses?action=new"
             className="inline-flex items-center gap-2 px-3.5 py-2 bg-purple-600 hover:bg-purple-700 active:scale-[0.98] text-white text-xs font-bold rounded-xl shadow-md shadow-purple-500/20 transition-all"
@@ -100,6 +112,12 @@ export default function SuperAdminDashboard() {
           </Link>
         </div>
       </div>
+
+      {/* Device Sync Modal */}
+      <DeviceSyncModal
+        isOpen={showDeviceModal}
+        onClose={() => setShowDeviceModal(false)}
+      />
 
       {/* Top Metric Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

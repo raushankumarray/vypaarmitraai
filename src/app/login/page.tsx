@@ -72,9 +72,39 @@ export default function LoginPage() {
 
   const { login, requestOtp, loginWithOtp } = useAuth();
 
-  // Multi-Device Auto-Sync on Mount: ensures newly setup Firebase and merchants sync immediately on any device
+  // Multi-Device Auto-Sync on Mount & 1-Click Device Pairing Token Handling
   useEffect(() => {
+    // 1. Standard Server & Cloud Auto-Sync
     localStore.syncWithServerAndCloud();
+
+    // 2. Handle 1-Click Device Pairing Link/QR (?device_sync=...)
+    if (typeof window !== 'undefined') {
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        const syncToken = urlParams.get('device_sync');
+        if (syncToken) {
+          const jsonStr = decodeURIComponent(escape(atob(syncToken)));
+          const payload = JSON.parse(jsonStr);
+
+          if (payload.firebaseCloud) {
+            localStore.saveFirebaseCloudConfig(payload.firebaseCloud);
+          }
+          if (payload.adminPass) {
+            localStore.changeUserPassword('usr_superadmin_bootstrap', payload.adminPass);
+          }
+          if (payload.autoLogin && payload.autoLogin.username && payload.autoLogin.password) {
+            login(payload.autoLogin.username, payload.autoLogin.password);
+          } else {
+            localStore.syncWithServerAndCloud();
+          }
+
+          // Clean query parameter from browser address bar
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }
+      } catch (err) {
+        console.warn('Device pairing token error:', err);
+      }
+    }
   }, []);
 
   // 60-Second Countdown Timer for OTP Resend
